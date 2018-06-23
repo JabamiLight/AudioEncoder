@@ -42,6 +42,7 @@ private:
     uint8_t** convert_data;
     AVFrame* swrFrame;
     uint8_t * swrBuffer;
+    int64_t frameIndex;
     int swrBufferSize;
 
     int publishBitRate;
@@ -68,7 +69,6 @@ public:
     int init(int bitRate, int channels, int bitsPerSample, const char* aacFilePath, const char * codec_name);
     void encode(byte* buffer, int size);
     void destroy();
-
 
 
 };

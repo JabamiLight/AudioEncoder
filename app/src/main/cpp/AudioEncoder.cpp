@@ -21,6 +21,7 @@ int AudioEncoder::init(int bitRate, int channels, int sampleRate, int bitsPerSam
     this->isWriteHeaderSuccess = false;
     totalEncodeTimeMills = 0;
     totalSWRTimeMills = 0;
+    frameIndex = 0;
     //采样率 码率 声道
     this->publishBitRate = bitRate;
     this->audioChannels = channels;
@@ -28,10 +29,8 @@ int AudioEncoder::init(int bitRate, int channels, int sampleRate, int bitsPerSam
 
     int ret;
     av_register_all();
-
     avFormatContext = avformat_alloc_context();
     LOGI("aacFilePath is %s ", aacFilePath);
-
     //一种方法
     //先探测格式，然后设置到avFormatContext中
 //    AVOutputFormat *fmt = av_guess_format(NULL, aacFilePath, NULL);
@@ -62,7 +61,6 @@ int AudioEncoder::init(int bitRate, int channels, int sampleRate, int bitsPerSam
 }
 
 AudioEncoder::AudioEncoder() {
-    av_register_all();
 }
 
 AudioEncoder::~AudioEncoder() {
@@ -72,25 +70,69 @@ AudioEncoder::~AudioEncoder() {
 int AudioEncoder::init(int bitRate, int channels, int bitsPerSample, const char *aacFilePath,
                        const char *codec_name) {
     return init(bitRate, channels, 44100, bitsPerSample, aacFilePath, codec_name);
-
-
-    return 0;
 }
 
 void AudioEncoder::encode(byte *buffer, int size) {
-    int bufferCursor=0;
-    int bufferSize=size;
-    while (bufferSize>=(bufferSize-samplesCursor)){
-        int copySize=buffer_size-samplesCursor;
-
+    int bufferCursor = 0;
+    int bufferSize = size;
+    while (bufferSize >= (buffer_size - samplesCursor)) {
+        int cpySize = buffer_size - samplesCursor;
+        memcpy(samples + samplesCursor, buffer + bufferCursor, cpySize);
+        bufferCursor += cpySize;
+        bufferSize -= cpySize;
+        long long beginEncodeTimeMills = getCurrentTime();
+        this->encodePacket();
+        totalEncodeTimeMills += (getCurrentTime() - beginEncodeTimeMills);
+        samplesCursor = 0;
     }
 
-
-
-
+    if (bufferSize > 0) {
+        memcpy(samples + samplesCursor, buffer + bufferCursor, bufferSize);
+        samplesCursor += bufferSize;
+    }
 }
 
 void AudioEncoder::destroy() {
+    LOGI("start destroy!!!");
+    //这里需要判断是否删除resampler(重采样音频格式/声道/采样率等)相关的资源
+    if (NULL != swrBuffer) {
+        free(swrBuffer);
+        swrBuffer = NULL;
+        swrBufferSize = 0;
+    }
+    if (NULL != swrContext) {
+        swr_free(&swrContext);
+        swrContext = NULL;
+    }
+    if (convert_data) {
+        av_freep(&convert_data[0]);
+        free(convert_data);
+    }
+    if (NULL != swrFrame) {
+        av_frame_free(&swrFrame);
+    }
+    if (NULL != samples) {
+        av_freep(&samples);
+    }
+    if (NULL != input_frame) {
+        av_frame_free(&input_frame);
+    }
+    if (this->isWriteHeaderSuccess) {
+//        avFormatContext->duration = this->duration * AV_TIME_BASE;
+        LOGI("duration is %.3lf", this->duration);
+        this->duration = 0;
+        av_write_trailer(avFormatContext);
+    }
+    if (NULL != avCodecContext) {
+        avcodec_close(avCodecContext);
+        av_free(avCodecContext);
+    }
+    if (NULL != avCodecContext && NULL != avFormatContext->pb) {
+        avio_close(avFormatContext->pb);
+    }
+
+    LOGI("end destroy!!! totalEncodeTimeMills is %d totalSWRTimeMills is %d", totalEncodeTimeMills,
+         totalSWRTimeMills);
 
 }
 
@@ -119,10 +161,7 @@ int AudioEncoder::alloc_audio_stream(const char *codec_name) {
     //配置编码aac规格
     avCodecContext->profile = FF_PROFILE_AAC_LOW;
     LOGI("avCodecContext->channels is %d", avCodecContext->channels);
-
-    if (avFormatContext->oformat->flags & AVFMT_GLOBALHEADER) {
-        avCodecContext->flags |= CODEC_FLAG_GLOBAL_HEADER;
-    }
+    avCodecContext->flags |= CODEC_FLAG_GLOBAL_HEADER;
     //使用名称来找
     //codec = avcodec_find_encoder_by_name(codec_name);
     //使用之前探测格式来找
@@ -196,6 +235,8 @@ int AudioEncoder::alloc_audio_stream(const char *codec_name) {
 //    avCodecContext->time_base.num=1;
 //    avCodecContext->time_base.den = avCodecContext->sample_rate;
 //    avCodecContext->frame_size = 1024;
+    audioStream->time_base.num=1;
+    audioStream->time_base.den=avCodecContext->sample_rate;
     return 0;
 }
 
@@ -272,4 +313,58 @@ int AudioEncoder::alloc_avframe() {
     }
 
     return ret;
+}
+
+void AudioEncoder::encodePacket() {
+
+    int ret, got_output;
+    AVPacket pkt;
+    av_init_packet(&pkt);
+    AVFrame *encode_frame;
+    if (swrContext) {
+        long long beginSWRTimeMills = getCurrentTime();
+        swr_convert(swrContext, convert_data, avCodecContext->frame_size,
+                    (const uint8_t **) input_frame->data, avCodecContext->frame_size);
+        int length =
+                avCodecContext->frame_size * av_get_bytes_per_sample(avCodecContext->sample_fmt);
+        for (int k = 0; k < 2; ++k) {
+            for (int j = 0; j < length; ++j) {
+                swrFrame->data[k][j] = convert_data[k][j];
+            }
+        }
+        totalSWRTimeMills += (getCurrentTime() - beginSWRTimeMills);
+        encode_frame = swrFrame;
+    } else {
+        encode_frame = input_frame;
+    }
+    encode_frame->pts = frameIndex++;
+    pkt.stream_index = audioStream->index;
+//    pkt.duration = (int) AV_NOPTS_VALUE;
+//    pkt.pts = pkt.dts = 0;
+    pkt.data = samples;
+    pkt.size = buffer_size;
+
+    ret = avcodec_encode_audio2(avCodecContext, &pkt, encode_frame, &got_output);
+    if (ret < 0) {
+        LOGI("Error encoding audio frame\n");
+        return;
+    }
+    if (got_output) {
+        if (avCodecContext->coded_frame && avCodecContext->coded_frame->pts != AV_NOPTS_VALUE) {
+            pkt.pts = av_rescale_q(avCodecContext->coded_frame->pts, avCodecContext->time_base,
+                                   audioStream->time_base);
+        }
+        //包含关键帧
+        pkt.flags |= AV_PKT_FLAG_KEY;
+        this->duration += (pkt.duration * av_q2d(audioStream->time_base));
+
+        //此函数负责交错地输出一个媒体包。如果调用者无法保证来自各个媒体流的包正确交错，则最好调用此函数输出媒体包，反之，可以调用av_write_frame以提高性能。
+
+        int writeCode = av_interleaved_write_frame(avFormatContext, &pkt);
+
+    }
+
+    av_free_packet(&pkt);
+
+
 }
